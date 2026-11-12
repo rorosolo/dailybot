@@ -122,8 +122,17 @@ def template_ws():
 
 
 def days_ws():
-    # A дата | B тип | C название | D описание | E готово | F перенесено
-    return sheet("Дни", ["Дата", "Тип", "Название", "Описание", "Готово", "Перенесено"])
+    # A дата | B тип | C название | D описание | E готово | F перенесено | G удалено
+    ws = sheet(
+        "Дни", ["Дата", "Тип", "Название", "Описание", "Готово", "Перенесено", "Удалено"]
+    )
+    if "days_hdr" not in _ws_cache:
+        _ws_cache["days_hdr"] = True
+        if ws.col_count < 7:
+            ws.add_cols(7 - ws.col_count)
+        if len(ws.row_values(1)) < 7:
+            ws.update_cell(1, 7, "Удалено")
+    return ws
 
 
 def norm_date(s: str) -> str:
@@ -187,8 +196,8 @@ def template_habits() -> list[tuple[str, str]]:
 def load_rows() -> list[dict]:
     out = []
     for i, r in enumerate(days_ws().get_all_values()[1:], start=2):
-        r = r + [""] * (6 - len(r))
-        if not r[2].strip():
+        r = r + [""] * (7 - len(r))
+        if not r[2].strip() or r[6].strip() == "1":
             continue
         out.append(
             {
@@ -218,8 +227,9 @@ def get_day(date_str: str) -> list[dict]:
 def ensure_day(date_str: str) -> list[dict]:
     """Создаёт список дня: привычки из шаблона + невыполненные дела вчерашнего дня."""
     rows = load_rows()
-    if any(r["date"] == date_str for r in rows):
-        return [r for r in rows if r["date"] == date_str]
+    today_rows = [r for r in rows if r["date"] == date_str]
+    if today_rows:
+        return sync_habits(date_str, today_rows)
     new = [[date_str, "привычка", n, d, "", ""] for n, d in template_habits()]
     if CARRY_OVER:
         prev = [r["date"] for r in rows if r["date"] < date_str]
@@ -231,6 +241,62 @@ def ensure_day(date_str: str) -> list[dict]:
     if new:
         days_ws().append_rows(new, value_input_option="RAW")
     return get_day(date_str)
+
+
+def sync_habits(date_str: str, today_rows: list[dict]) -> list[dict]:
+    """Подтягивает правки из листа «Шаблон» в уже созданный список дня:
+    новые привычки добавляются, изменённые описания обновляются."""
+    have = {r["name"].lower(): r for r in today_rows if r["kind"] == "habit"}
+    ws = days_ws()
+    new, changed = [], False
+    for name, desc in template_habits():
+        key = name.lower()
+        if key in have:
+            r = have[key]
+            if r.get("row") and r["desc"] != desc:
+                ws.update_cell(r["row"], 4, desc)
+                changed = True
+        else:
+            new.append([date_str, "привычка", name, desc, "", ""])
+            have[key] = {"row": None, "desc": desc}
+    if new:
+        ws.append_rows(new, value_input_option="RAW")
+        changed = True
+    return get_day(date_str) if changed else today_rows
+
+
+def remove_from_template(name: str):
+    ws = template_ws()
+    key = name.strip().lower()
+    hits = [
+        i
+        for i, r in enumerate(ws.get_all_values()[1:], start=2)
+        if r and r[0].strip().lower() == key
+    ]
+    for i in reversed(hits):
+        ws.delete_rows(i)
+
+
+def delete_item(row: int):
+    """Привычка удаляется из «Шаблона» и из сегодняшнего списка, дело — только из списка.
+    Строки в «Дни» не удаляем, а помечаем, чтобы номера строк у кнопок не сдвигались."""
+    rows = load_rows()
+    it = next((r for r in rows if r["row"] == row), None)
+    if not it:
+        return None
+    if it["kind"] == "habit":
+        remove_from_template(it["name"])
+    ws = days_ws()
+    for r in rows:
+        if r["date"] == it["date"] and r["kind"] == it["kind"] and r["name"].lower() == it["name"].lower():
+            ws.update_cell(r["row"], 7, "1")
+    return it
+
+
+def find_items(items: list[dict], query: str) -> list[dict]:
+    q = query.strip().lower()
+    exact = [i for i in items if i["name"].lower() == q]
+    return exact or [i for i in items if q in i["name"].lower()]
 
 
 def toggle(row: int) -> str:
@@ -314,6 +380,7 @@ def render_form(date_str: str, items: list[dict]):
     for i in items:
         label = ("✅ " if i["done"] else "⬜ ") + ("📌 " if i["kind"] == "task" else "") + i["name"]
         kb.append([{"text": label[:48], "callback_data": f"t:{i['row']}"}])
+    kb.append([{"text": "🐝 Меню команд", "callback_data": "m"}])
     return "\n".join(lines), {"inline_keyboard": kb}
 
 
@@ -439,16 +506,42 @@ def post_summary(now: datetime, chat_id=CHAT_ID):
     send(chat_id, render_summary(now.strftime("%Y-%m-%d"), load_rows()))
 
 
-HELP = (
-    "Привет! Я планер дня 🐝\n\n"
-    "/today — форма на сегодня\n"
-    "/add Название, описание — разовое дело\n"
-    "/habit Название, описание — новая ежедневная привычка\n"
-    "/stats — сводка прямо сейчас\n\n"
-    "Привычки можно править в листе «Шаблон» таблицы.\n"
-    f"Утром ~{MORNING} шлю форму, вечером ~{EVENING} — итоги."
-    + ("" if os.environ.get("INSTANT") else "\nЯ просыпаюсь раз в несколько минут, поэтому ответы приходят с небольшой задержкой.")
-)
+def build_menu():
+    text = (
+        "🐝 <b>Меню планера</b>\n\n"
+        "📋 /today — форма на сегодня\n"
+        "📊 /stats — сводка прямо сейчас\n"
+        "➕ /add Название, описание — разовое дело\n"
+        "🌿 /habit Название, описание — новая привычка\n"
+        "🗑 /del — удалить привычку или дело\n\n"
+        "🌼 Привычки можно править и в листе «Шаблон» таблицы.\n"
+        f"⏰ Утром ~{MORNING} шлю форму, вечером ~{EVENING} — итоги."
+    )
+    if not os.environ.get("INSTANT"):
+        text += "\n\nЯ просыпаюсь раз в несколько минут, поэтому ответы приходят с небольшой задержкой."
+    kb = {
+        "inline_keyboard": [
+            [
+                {"text": "📋 Форма на сегодня", "callback_data": "m:today"},
+                {"text": "📊 Сводка дня", "callback_data": "m:stats"},
+            ],
+            [
+                {"text": "➕ Дело", "callback_data": "m:add"},
+                {"text": "🌿 Привычка", "callback_data": "m:habit"},
+            ],
+            [
+                {"text": "🗑 Удалить", "callback_data": "m:del"},
+                {"text": "✖️ Закрыть", "callback_data": "m:close"},
+            ],
+        ]
+    }
+    return text, kb
+
+
+HINTS = {
+    "m:add": "➕ Разовое дело\n\nНапиши в чат:\n/add Купить молоко, у дома\n\nОписание писать необязательно.",
+    "m:habit": "🌿 Новая привычка\n\nНапиши в чат:\n/habit Медитация, 10 минут тишины\n\nОна появится в шаблоне и в сегодняшнем списке.",
+}
 
 
 def split_name_desc(rest: str) -> tuple[str, str]:
@@ -478,8 +571,8 @@ def handle_message(m: dict, now: datetime):
         return
 
     today = now.strftime("%Y-%m-%d")
-    if cmd == "/start":
-        send(chat, HELP)
+    if cmd in ("/start", "/menu", "/help"):
+        send(chat, *build_menu())
     elif cmd == "/today":
         post_form(now, chat)
     elif cmd == "/stats":
@@ -493,6 +586,20 @@ def handle_message(m: dict, now: datetime):
         add_task(today, name, desc)
         send(chat, "Добавила в дела 📌 Обновляю форму:")
         post_form(now, chat)
+    elif cmd == "/del":
+        items = ensure_day(today)
+        if not items:
+            send(chat, "Удалять пока нечего 🌼")
+        elif not rest:
+            send(chat, *delete_menu(items))
+        else:
+            found = find_items(items, rest)
+            if not found:
+                send(chat, "Не нашла такого в сегодняшнем списке 🤔 Посмотри /del")
+            elif len(found) == 1:
+                send(chat, *delete_confirm(found[0]))
+            else:
+                send(chat, *delete_menu(found))
     elif cmd == "/habit":
         name, desc = split_name_desc(rest)
         if not name:
@@ -504,11 +611,92 @@ def handle_message(m: dict, now: datetime):
         post_form(now, chat)
 
 
+def delete_menu(items: list[dict]):
+    kb = [
+        [{
+            "text": f"🗑 {'🌿' if i['kind'] == 'habit' else '📌'} {i['name']}"[:48],
+            "callback_data": f"d:{i['row']}",
+        }]
+        for i in items
+    ]
+    kb.append([{"text": "↩️ Отмена", "callback_data": "dn"}])
+    text = (
+        "Что удалить? 🗑\n"
+        "🌿 Привычка пропадёт совсем (и из «Шаблона»), 📌 дело — из сегодняшнего списка."
+    )
+    return text, {"inline_keyboard": kb}
+
+
+def delete_confirm(item: dict):
+    what = "привычку" if item["kind"] == "habit" else "дело"
+    extra = (
+        "Она исчезнет из шаблона и больше не будет появляться."
+        if item["kind"] == "habit"
+        else "Оно исчезнет из сегодняшнего списка."
+    )
+    text = f"Удалить {what} <b>«{esc(item['name'])}»</b>?\n{extra}"
+    kb = {"inline_keyboard": [[
+        {"text": "✅ Да, удалить", "callback_data": f"dy:{item['row']}"},
+        {"text": "↩️ Отмена", "callback_data": "dn"},
+    ]]}
+    return text, kb
+
+
 def handle_callback(q: dict):
+    data = q.get("data", "")
+    if data in HINTS:  # всплывающая подсказка вместо ответа
+        tg("answerCallbackQuery", callback_query_id=q["id"], text=HINTS[data], show_alert=True)
+        return
     tg("answerCallbackQuery", callback_query_id=q["id"])
     msg = q.get("message")
-    data = q.get("data", "")
-    if not msg or msg["chat"]["id"] != CHAT_ID or not data.startswith("t:"):
+    if not msg or msg["chat"]["id"] != CHAT_ID:
+        return
+    chat_id, mid = msg["chat"]["id"], msg["message_id"]
+
+    if data == "m":
+        send(chat_id, *build_menu())
+        return
+    if data.startswith("m:"):
+        tg("deleteMessage", chat_id=chat_id, message_id=mid)  # убираем меню
+        now = datetime.now(TZ)
+        if data == "m:today":
+            post_form(now, chat_id)
+        elif data == "m:stats":
+            post_summary(now, chat_id)
+        elif data == "m:del":
+            items = ensure_day(now.strftime("%Y-%m-%d"))
+            if items:
+                send(chat_id, *delete_menu(items))
+            else:
+                send(chat_id, "Удалять пока нечего 🌼")
+        return
+
+    if data == "dn":
+        tg("editMessageText", chat_id=chat_id, message_id=mid,
+           text="Хорошо, ничего не удаляю 🌼", reply_markup={"inline_keyboard": []})
+        return
+    if data.startswith("d:"):
+        row = int(data[2:])
+        it = next((r for r in load_rows() if r["row"] == row), None)
+        if not it:
+            tg("editMessageText", chat_id=chat_id, message_id=mid,
+               text="Это уже удалено 🌼", reply_markup={"inline_keyboard": []})
+            return
+        text, kb = delete_confirm(it)
+        tg("editMessageText", chat_id=chat_id, message_id=mid, text=text,
+           reply_markup=kb, parse_mode="HTML")
+        return
+    if data.startswith("dy:"):
+        it = delete_item(int(data[3:]))
+        text = (
+            f"🗑 Удалила: <b>«{esc(it['name'])}»</b>" if it else "Это уже удалено 🌼"
+        )
+        tg("editMessageText", chat_id=chat_id, message_id=mid, text=text,
+           reply_markup={"inline_keyboard": []}, parse_mode="HTML")
+        if it:
+            post_form(datetime.now(TZ), chat_id)
+        return
+    if not data.startswith("t:"):
         return
     d = toggle(int(data[2:]))
     items = [r for r in load_rows() if r["date"] == d]
