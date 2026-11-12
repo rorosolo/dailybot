@@ -92,6 +92,8 @@ def log_ws():
     ws = sheet("Журнал", ["Дата", "Задача", "Готово", "Напоминание", "Напомнено"])
     if "hdr5" not in _ws_cache:
         _ws_cache["hdr5"] = True
+        if ws.col_count < 5:
+            ws.add_cols(5 - ws.col_count)
         if len(ws.row_values(1)) < 5:
             ws.update_cell(1, 5, "Напомнено")
     return ws
